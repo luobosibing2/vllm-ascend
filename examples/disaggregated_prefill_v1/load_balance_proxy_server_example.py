@@ -129,7 +129,7 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 try:
     from vllm.logger import init_logger
@@ -156,23 +156,32 @@ class InstanceType:
 
 
 TAINT_PRIORITY = 1e15
+DEFAULT_TOKENIZE_TIMEOUT = 5.0
 
 
 class ServerState:
     def __init__(self, host, port):
         self.host = host
         self.port = port
-        self.url = f"http://{host}:{port}/v1"
+        self.root_url = f"http://{host}:{port}"
+        self.url = f"{self.root_url}/v1"
         try:
             ip = ipaddress.ip_address(self.host)
             if isinstance(ip, ipaddress.IPv6Address):
-                self.url = f"http://[{host}]:{port}/v1"
+                self.root_url = f"http://[{host}]:{port}"
+                self.url = f"{self.root_url}/v1"
         except Exception:
             pass
+        limits = httpx.Limits(max_connections=100000, max_keepalive_connections=100000)
         self.client = httpx.AsyncClient(
             timeout=None,
             base_url=self.url,
-            limits=httpx.Limits(max_connections=100000, max_keepalive_connections=100000),
+            limits=limits,
+        )
+        self.root_client = httpx.AsyncClient(
+            timeout=None,
+            base_url=self.root_url,
+            limits=limits,
         )
         self.active_tokens = 0
         self.active_kv_cache = 0  # Only for prefiller
@@ -524,11 +533,19 @@ def parse_args():
         default=10,
         help="Check interval (seconds) for waiting nodes to be started",
     )
+    parser.add_argument(
+        "--tokenize-timeout",
+        type=float,
+        default=DEFAULT_TOKENIZE_TIMEOUT,
+        help="Timeout (seconds) for /tokenize precheck requests",
+    )
     args = parser.parse_args()
     if len(args.prefiller_hosts) != len(args.prefiller_ports):
         raise ValueError("Number of prefiller hosts must match number of prefiller ports")
     if len(args.decoder_hosts) != len(args.decoder_ports):
         raise ValueError("Number of decoder hosts must match number of decoder ports")
+    if args.tokenize_timeout <= 0:
+        raise ValueError("tokenize_timeout must be greater than 0")
     args.prefiller_instances = list(zip(args.prefiller_hosts, args.prefiller_ports))
     args.decoder_instances = list(zip(args.decoder_hosts, args.decoder_ports))
     return args
@@ -542,8 +559,10 @@ async def lifespan(app: FastAPI):
     yield
     for p in proxy_state.prefillers:
         await p.client.aclose()
+        await p.root_client.aclose()
     for d in proxy_state.decoders:
         await d.client.aclose()
+        await d.root_client.aclose()
 
 
 async def listen_for_disconnect(request: Request) -> None:
@@ -656,6 +675,170 @@ async def stream_service_response_with_retry(
                     raise e
 
 
+@dataclass
+class TokenizeResult:
+    count: int
+    max_model_len: int
+    server: ServerState
+
+
+def _openai_error_response(message: str, status_code: int, param: str | None = None) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "message": message,
+                "type": "invalid_request_error" if status_code < 500 else "server_error",
+                "param": param,
+                "code": None,
+            }
+        },
+    )
+
+
+def _build_tokenize_payload(api: str, req_data: dict) -> dict | None:
+    if api == "/chat/completions":
+        messages = req_data.get("messages")
+        if not isinstance(messages, list):
+            return None
+        payload = {"messages": messages}
+        for field in (
+            "model",
+            "add_generation_prompt",
+            "continue_final_message",
+            "add_special_tokens",
+            "chat_template",
+            "chat_template_kwargs",
+            "media_io_kwargs",
+            "mm_processor_kwargs",
+            "tools",
+        ):
+            if field in req_data:
+                payload[field] = req_data[field]
+        return payload
+
+    if api == "/completions":
+        prompt = req_data.get("prompt")
+        if not isinstance(prompt, str):
+            return None
+        payload = {"prompt": prompt}
+        for field in ("model", "add_special_tokens"):
+            if field in req_data:
+                payload[field] = req_data[field]
+        return payload
+
+    return None
+
+
+def _get_candidate_servers(instance_type: str) -> list[ServerState]:
+    if instance_type == InstanceType.PREFILL:
+        servers = proxy_state.prefillers
+        tainted_servers = proxy_state.tainted_prefillers
+    else:
+        servers = proxy_state.decoders
+        tainted_servers = proxy_state.tainted_decoders
+
+    candidates = [server for server in servers if server not in tainted_servers]
+    return candidates or list(servers)
+
+
+async def _tokenize_with_representative(instance_type: str, payload: dict) -> TokenizeResult | None:
+    headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+    args = globals().get("global_args")
+    tokenize_timeout = getattr(args, "tokenize_timeout", DEFAULT_TOKENIZE_TIMEOUT)
+    for server in _get_candidate_servers(instance_type):
+        try:
+            response = await server.root_client.post(
+                "/tokenize",
+                json=payload,
+                headers=headers,
+                timeout=tokenize_timeout,
+            )
+            response.raise_for_status()
+            response_json = response.json()
+            count = response_json.get("count")
+            max_model_len = response_json.get("max_model_len")
+            if not isinstance(count, int) or not isinstance(max_model_len, int):
+                raise ValueError(f"Unexpected /tokenize response: {response_json}")
+            return TokenizeResult(count=count, max_model_len=max_model_len, server=server)
+        except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as e:
+            logger.warning("Failed to tokenize on %s %s: %s", instance_type, server.root_url, e)
+    return None
+
+
+def _get_requested_max_output_tokens(api: str, req_data: dict) -> int | None:
+    if api == "/chat/completions":
+        if req_data.get("max_completion_tokens") is not None:
+            value = req_data.get("max_completion_tokens")
+        else:
+            value = req_data.get("max_tokens")
+    else:
+        value = req_data.get("max_tokens", 16)
+
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("max output tokens must be a non-negative integer")
+    return value
+
+
+async def _precheck_context_length(api: str, req_data: dict) -> JSONResponse | None:
+    tokenize_payload = _build_tokenize_payload(api, req_data)
+    if tokenize_payload is None:
+        return None
+
+    prefiller_tokenize = await _tokenize_with_representative(InstanceType.PREFILL, tokenize_payload)
+    if prefiller_tokenize is None:
+        return _openai_error_response(
+            "Unable to validate request length because all prefiller /tokenize requests failed.",
+            status_code=503,
+        )
+    if prefiller_tokenize.count >= prefiller_tokenize.max_model_len:
+        return _openai_error_response(
+            "Prefill node maximum context length is "
+            f"{prefiller_tokenize.max_model_len} tokens, but the prompt contains "
+            f"{prefiller_tokenize.count} tokens after tokenization/chat template rendering. "
+            "Please reduce the length of the input prompt.",
+            status_code=400,
+            param="input_tokens",
+        )
+
+    decoder_tokenize = await _tokenize_with_representative(InstanceType.DECODE, tokenize_payload)
+    if decoder_tokenize is None:
+        return _openai_error_response(
+            "Unable to validate request length because all decoder /tokenize requests failed.",
+            status_code=503,
+        )
+    if decoder_tokenize.count >= decoder_tokenize.max_model_len:
+        return _openai_error_response(
+            "Decode node maximum context length is "
+            f"{decoder_tokenize.max_model_len} tokens, but the prompt contains "
+            f"{decoder_tokenize.count} tokens after tokenization/chat template rendering. "
+            "Please reduce the length of the input prompt.",
+            status_code=400,
+            param="input_tokens",
+        )
+
+    try:
+        max_output_tokens = _get_requested_max_output_tokens(api, req_data)
+    except ValueError as e:
+        return _openai_error_response(str(e), status_code=400, param="max_tokens")
+
+    if max_output_tokens is not None and decoder_tokenize.count + max_output_tokens > decoder_tokenize.max_model_len:
+        return _openai_error_response(
+            "Decode node maximum context length is "
+            f"{decoder_tokenize.max_model_len} tokens. However, you requested "
+            f"{max_output_tokens} output tokens and the prompt contains "
+            f"{decoder_tokenize.count} input tokens, for a total of "
+            f"{decoder_tokenize.count + max_output_tokens} tokens. "
+            "Please reduce the length of the input prompt or the number of requested output tokens.",
+            status_code=400,
+            param="max_tokens",
+        )
+
+    return None
+
+
 async def _handle_select_instance(api: str, req_data: Any, request_length: int):
     prefiller_score = proxy_state.calculate_prefill_scores(request_length)
     logger.debug("Request length: %s, Prefiller score: %s", request_length, prefiller_score)
@@ -708,11 +891,17 @@ class InstanceInfo:
 
 
 async def _handle_completions(api: str, request: Request):
+    request_counted = False
     try:
-        proxy_state.request_num += 1
         req_data = await request.json()
         req_body = await request.body()
         request_length = len(req_body)
+        precheck_response = await _precheck_context_length(api, req_data)
+        if precheck_response is not None:
+            return precheck_response
+
+        proxy_state.request_num += 1
+        request_counted = True
         instance_info = await _handle_select_instance(api, req_data, request_length)
         stream_flag = bool(req_data.get("stream", False))
         chat_flag = "messages" in req_data
@@ -836,7 +1025,8 @@ async def _handle_completions(api: str, request: Request):
         print(f"Error occurred in disagg prefill proxy server - {api} endpoint")
         print(e)
         print("".join(traceback.format_exception(*exc_info)))
-        proxy_state.request_num -= 1
+        if request_counted:
+            proxy_state.request_num -= 1
         raise
 
 

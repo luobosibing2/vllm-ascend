@@ -138,6 +138,7 @@ python load_balance_proxy_server_example.py --host localhost --prefiller-hosts h
 `--prefiller-ports`: Set this parameter to the port numbers of all prefill (P) nodes, which were defined in step 1 when starting the prefill nodes. Write the port number after the configuration in sequence and leave a blank space between the port number and the port number. The sequence must be one-to-one mapping to the IP address of --prefiller-hosts.<br>
 `--decoder-hosts`: Set this parameter to the IP addresses of all d nodes. In the xpyd scenario, add the IP addresses to the end of this configuration item and leave a blank space between the IP addresses.<br>
 `--decoder-ports`: Set this parameter to the port number of all d nodes, which is the configuration of the port number for the vllm to start the service in step 4. Set port to the end of the configuration, and leave a blank space between port and port. The sequence must be one-to-one mapping to the IP address of --decoder-hosts.<br>
+`--tokenize-timeout`: Set the timeout in seconds for proxy-side `/tokenize` precheck requests. The default value is 5 seconds. The proxy uses `/tokenize` before dispatch to check whether the prompt can fit on the prefiller node and whether `prompt_tokens + max_tokens` can fit on the decoder node. See [Load Balance Proxy Length Precheck](load_balance_proxy_length_precheck.md) for details.<br>
 
 ### 4. Run Inference
 
