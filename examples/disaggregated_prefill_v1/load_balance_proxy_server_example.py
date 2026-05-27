@@ -130,6 +130,7 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.requests import ClientDisconnect
 
 try:
     from vllm.logger import init_logger
@@ -139,6 +140,26 @@ except ImportError:
     import logging
 
     logger = logging.getLogger(__name__)
+
+
+class DisconnectAwareStreamingResponse(StreamingResponse):
+    def __init__(self, *args, on_disconnect=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._on_disconnect = on_disconnect
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        except (ClientDisconnect, asyncio.CancelledError):
+            if self._on_disconnect is not None:
+                self._on_disconnect()
+            aclose = getattr(self.body_iterator, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except Exception as e:
+                    logger.warning("Failed to close disconnected response body iterator: %s", e)
+            raise
 
 # Add uvloop for faster event loop if available
 try:
@@ -915,20 +936,52 @@ async def _handle_completions(api: str, request: Request):
             origin_prompt = ""
         # refer to vLLM sampling_params: max_token default value
         origin_max_tokens = req_data.get("max_tokens", 16)
+        released_kv = False
+        aborted_prefiller = False
+        released_decoder = False
+        released_request = False
+
+        def release_prefiller_kv_once():
+            nonlocal released_kv
+            if not released_kv:
+                proxy_state.release_prefiller_kv(instance_info.prefiller_idx, instance_info.prefiller_score)
+                released_kv = True
+
+        def abort_prefiller_request_once():
+            nonlocal aborted_prefiller
+            if not aborted_prefiller:
+                proxy_state.abort_prefiller_request(instance_info.prefiller_idx, instance_info.request_id)
+                aborted_prefiller = True
+                return True
+            return False
+
+        def release_stream_resources_once():
+            nonlocal released_decoder, released_request
+            release_prefiller_kv_once()
+            if not released_decoder:
+                proxy_state.release_decoder(instance_info.decoder_idx, instance_info.decoder_score)
+                released_decoder = True
+            if not released_request:
+                proxy_state.request_num -= 1
+                released_request = True
+
+        def abort_and_cleanup_disconnected_stream():
+            if abort_prefiller_request_once():
+                logger.info(
+                    "Streaming from decoder %s was cancelled by the client or ASGI server; "
+                    "the aborted request %s will be routed to the target prefiller when a new "
+                    "request is ready to dispatch to it",
+                    instance_info.decoder.url,
+                    instance_info.request_id,
+                )
+            release_stream_resources_once()
 
         async def generate_stream():
             nonlocal instance_info
             generated_token = ""
-            released_kv = False
             retry_count = 0
             retry = True
             completion_tokens = 0
-
-            def release_prefiller_kv_once():
-                nonlocal released_kv
-                if not released_kv:
-                    proxy_state.release_prefiller_kv(instance_info.prefiller_idx, instance_info.prefiller_score)
-                    released_kv = True
 
             # Only one await per chunk, minimal logic in loop
             try:
@@ -998,6 +1051,7 @@ async def _handle_completions(api: str, request: Request):
                             chunk = json.dumps(chunk_json).encode("utf-8")
                         yield chunk
             except asyncio.CancelledError:
+                abort_and_cleanup_disconnected_stream()
                 raise
             except Exception as e:
                 logger.error(
@@ -1007,17 +1061,19 @@ async def _handle_completions(api: str, request: Request):
                     e,
                     instance_info.request_id,
                 )
-                proxy_state.abort_prefiller_request(instance_info.prefiller_idx, instance_info.request_id)
+                abort_prefiller_request_once()
                 release_prefiller_kv_once()
             finally:
                 # After streaming is done or cancelled, release tokens.
-                release_prefiller_kv_once()
-                proxy_state.release_decoder(instance_info.decoder_idx, instance_info.decoder_score)
-                proxy_state.request_num -= 1
+                release_stream_resources_once()
 
         # Determine the correct media type based on stream flag
         media_type = "text/event-stream; charset=utf-8" if stream_flag else "application/json"
-        return StreamingResponse(generate_stream(), media_type=media_type)
+        return DisconnectAwareStreamingResponse(
+            generate_stream(),
+            media_type=media_type,
+            on_disconnect=abort_and_cleanup_disconnected_stream,
+        )
     except Exception as e:
         import traceback
 
